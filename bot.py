@@ -33,10 +33,22 @@ bot = commands.Bot(command_prefix='!', intents=intents)
 users_list = {}
 weekly_entries = {}
 embed_messages = {}
+daily_goals = {}
 channel_id = 1404893452264800330
 simulated_offset = 0
 
 current_date = datetime.now().date()
+
+@bot.command()
+async def goal(ctx, hours: float):
+    secs = int(hours * 3600)
+    daily_goals[ctx.author.id] = secs
+
+    if ctx.author.id in users_list:
+        users_list[ctx.author.id]['Goal'] = secs
+
+    await ctx.send(f"{ctx.author.display_name}, daily goal set to {hours} hour(s).")
+
 
 @tasks.loop(seconds=15)
 async def check_date_change():
@@ -62,6 +74,11 @@ async def check_date_change():
         if len(weekly_entries) == 7:
             await send_weekly_result()
 
+def make_progress_bar(current, goal, length=10):
+    pct = min(current / goal, 1.0) if goal > 0 else 0
+    filled = int(pct * length)
+    bar = '▰' * filled + '▱' * (length - filled)
+    return f"{bar}  {int(pct * 100)}%"
 
 
 def SaveDaily(date, daily_totals):
@@ -113,19 +130,39 @@ def format_time(seconds):
 async def daily_reset():
     pass
 
-async def create_embed_message(user, total_seconds, is_paused=False):
-    embed = discord.Embed(
-        title=f"{user.display_name}'s Study Session",
-        color=0x00ff00 if not is_paused else 0xff9900)
+async def create_embed_message(user, total_seconds, goal, is_paused=False):
     
-    status = "⏸️ PAUSED" if is_paused else "⏯️ ACTIVE"
-    embed.add_field(name="Status", value=status, inline=True)
-    embed.add_field(name="Total Time", value=format_time(total_seconds), inline=True)
-    embed.add_field(name="Date", value=datetime.now().strftime("%Y-%m-%d"), inline=True)
-    
-    embed.set_footer(text="⏸️- PAUSE, ⏯️ - RESUME, 📊 - DISPLAY" )
-    return embed
 
+    embed = discord.Embed(
+        title="🎯 Study Session",
+        description=f"*by {user.display_name}*",
+        color=0x00ff00 if not is_paused else 0xff9900
+    )
+    elapsed_str = format_time(total_seconds)  
+    embed.add_field(
+        name="⏱️ Time Elapsed",
+        value=elapsed_str,
+        inline=False
+    )
+    
+    embed.add_field(
+        name=f"📊 Daily Goal ({format_time(goal)})",
+        value=make_progress_bar(total_seconds, goal),
+        inline=False
+    )
+
+    since_ts = users_list[user.id]['Since']
+    status_text = "🟢 Active" if not is_paused else "🟠 Paused"
+    embed.add_field(
+        name="Status & Since",
+        value=f"{status_text}\nSince: {since_ts.strftime('%Y-%m-%d %H:%M')}",
+        inline=False
+    )
+
+    # Footer with control legend
+    embed.set_footer(text="⏸️ Pause • ▶️ Resume • 📊 Stats • 🎯 Set Goal")
+
+    return embed
 
 
 @tasks.loop(seconds=1)
@@ -135,6 +172,7 @@ async def update_embed_message():
             udata = users_list[user_id]
             msg = msg_data['message']
             user = msg_data['user']
+            goal = users_list[user.id].get('Goal')
 
             total_time = udata['total']
             paused = True
@@ -142,7 +180,7 @@ async def update_embed_message():
                 total_time += (datetime.now() - udata['Start']).total_seconds()
                 paused = False
 
-            embed = await create_embed_message(user, total_time, paused)
+            embed = await create_embed_message(user, total_time, goal, paused)
         try:
             await msg.edit(embed=embed)
         except discord.NotFound:
@@ -150,12 +188,12 @@ async def update_embed_message():
 
 
 @bot.command()
-async def startstudy(ctx):
+async def study(ctx):
     user = ctx.author
     if user.voice and user.voice.channel:
         if user.id not in users_list:
-            users_list[user.id] = {'Start': datetime.now(), 'total': 0}
-            embed = await create_embed_message(user, 0)
+            users_list[user.id] = {'Start': datetime.now(),'Since': datetime.now(), 'total': 0, 'Goal': daily_goals.get(user.id, 2*3600)}
+            embed = await create_embed_message(user, 0, users_list[user.id].get('Goal'))
             msg = await ctx.send(embed=embed)
             for emoji in ["⏸️", "▶️", "📊"]:
                 await msg.add_reaction(emoji)
@@ -257,6 +295,7 @@ async def on_ready():
     load_weekly_from_db()
     update_embed_message.start()
     check_date_change.start()
+    await bot.get_channel(channel_id).send(f"17vi is here, type !info for more information. @everyone")
 
 
 @bot.event
@@ -350,5 +389,9 @@ async def weekly(ctx):
     msg = "\n".join(lines)
     for chunk in [msg[i:i+2000] for i in range(0, len(msg), 2000)]:
         await ctx.send(chunk)
+
+@bot.command()
+async def info(ctx):
+    await bot.get_channel(channel_id).send("LIST OF COMMANDS\n\n!study - Start your study session\n!pause - Pause your current study session\n!resume - Resume your current study session\n!display - Display the time on your current study session\n!daily - View stats on everyones study sessions for the day\n!weekly - View stats for the whole week\n!goal (goal in hours) - Set a daily goal, Default is 2 hours")
 
 bot.run(token, log_handler=handler, log_level=logging.DEBUG )
