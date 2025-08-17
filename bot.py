@@ -5,7 +5,11 @@ from dotenv import load_dotenv
 import os
 import logging
 import sqlite3
-
+import json
+import asyncio
+import signal
+import sys
+import atexit
 
 load_dotenv()
 token = os.getenv('DISCORD_TOKEN')
@@ -21,6 +25,14 @@ c.execute("""
     PRIMARY KEY (date, user_id)
   )
 """)
+
+c.execute("""
+CREATE TABLE IF NOT EXISTS bot_state (
+key TEXT PRIMARY KEY,
+value TEXT
+)
+""")
+
 conn.commit()
 
 handler = logging.FileHandler(filename="debug.log", encoding='utf-8', mode = 'w')
@@ -34,10 +46,75 @@ users_list = {}
 weekly_entries = {}
 embed_messages = {}
 daily_goals = {}
-channel_id = 1404893452264800330
+channel_id = 1404847567485014057
 simulated_offset = 0
 
 current_date = datetime.now().date()
+
+def save_bot_state():
+    """Save current bot state to database"""
+    try:
+        # Save users_list
+        c.execute("INSERT OR REPLACE INTO bot_state (key, value) VALUES (?, ?)", 
+                 ("users_list", json.dumps(users_list, default=str)))
+        
+        # Save daily_goals
+        c.execute("INSERT OR REPLACE INTO bot_state (key, value) VALUES (?, ?)", 
+                 ("daily_goals", json.dumps(daily_goals)))
+        
+        # Save current_date and simulated_offset
+        c.execute("INSERT OR REPLACE INTO bot_state (key, value) VALUES (?, ?)", 
+                 ("current_date", current_date.isoformat()))
+        c.execute("INSERT OR REPLACE INTO bot_state (key, value) VALUES (?, ?)", 
+                 ("simulated_offset", str(simulated_offset)))
+        
+        conn.commit()
+        print("✅ Bot state saved to database")
+    except Exception as e:
+        print(f"❌ Error saving bot state: {e}")
+
+def load_bot_state():
+    """Load bot state from database"""
+    global users_list, daily_goals, current_date, simulated_offset
+    
+    try:
+        # Load users_list
+        result = c.execute("SELECT value FROM bot_state WHERE key = ?", ("users_list",)).fetchone()
+        if result:
+            loaded_users = json.loads(result[0])
+            # Convert datetime strings back to datetime objects
+            for uid, data in loaded_users.items():
+                if isinstance(data.get('Start'), str) and data['Start'] != 'Paused':
+                    try:
+                        data['Start'] = datetime.fromisoformat(data['Start'])
+                    except:
+                        data['Start'] = 'Paused'
+                if isinstance(data.get('Since'), str):
+                    try:
+                        data['Since'] = datetime.fromisoformat(data['Since'])
+                    except:
+                        data['Since'] = datetime.now()
+            users_list = {int(k): v for k, v in loaded_users.items()}
+        
+        # Load daily_goals
+        result = c.execute("SELECT value FROM bot_state WHERE key = ?", ("daily_goals",)).fetchone()
+        if result:
+            daily_goals = {int(k): v for k, v in json.loads(result[0]).items()}
+        
+        # Load current_date
+        result = c.execute("SELECT value FROM bot_state WHERE key = ?", ("current_date",)).fetchone()
+        if result:
+            current_date = datetime.fromisoformat(result[0]).date()
+        
+        # Load simulated_offset
+        result = c.execute("SELECT value FROM bot_state WHERE key = ?", ("simulated_offset",)).fetchone()
+        if result:
+            simulated_offset = int(result[0])
+            
+        print("✅ Bot state loaded from database")
+    except Exception as e:
+        print(f"❌ Error loading bot state: {e}")
+
 
 @bot.command()
 async def goal(ctx, hours: float):
@@ -70,6 +147,7 @@ async def check_date_change():
         weekly_entries[old_date] = daily_totals
         users_list.clear()
         embed_messages.clear()
+        save_bot_state()
 
         if len(weekly_entries) == 7:
             await send_weekly_result()
@@ -168,40 +246,78 @@ async def create_embed_message(user, total_seconds, goal, is_paused=False):
 @tasks.loop(seconds=1)
 async def update_embed_message():
     for user_id, msg_data in list(embed_messages.items()):
-        if user_id in users_list:
-            udata = users_list[user_id]
-            msg = msg_data['message']
-            user = msg_data['user']
-            goal = users_list[user.id].get('Goal')
+        if user_id not in users_list:
+            continue
 
-            total_time = udata['total']
-            paused = True
-            if isinstance(udata['Start'], datetime):
-                total_time += (datetime.now() - udata['Start']).total_seconds()
-                paused = False
+        udata = users_list[user_id]
+        msg = msg_data['message']
+        user = msg_data['user']
+        goal = udata.get('Goal', 2 * 3600)
 
-            embed = await create_embed_message(user, total_time, goal, paused)
-        try:
-            await msg.edit(embed=embed)
-        except discord.NotFound:
-            del embed_messages[user_id]
+        # Determine paused state
+        is_paused = not isinstance(udata['Start'], datetime)
 
+        # Calculate total_time
+        total_time = udata['total']
+        if not is_paused:
+            total_time += (datetime.now() - udata['Start']).total_seconds()
+
+        # Round to integer seconds for comparison
+        curr_seconds = int(total_time)
+
+        # Pull last state or default
+        last_seconds, last_paused = udata.get('last_state', (-1, None))
+
+        # Only update if seconds changed or paused status changed
+        if curr_seconds != last_seconds or is_paused != last_paused:
+            # Save new state
+            udata['last_state'] = (curr_seconds, is_paused)
+
+            # Generate and send updated embed
+            embed = await create_embed_message(user, total_time, goal, is_paused)
+            try:
+                await msg.edit(embed=embed)
+            except discord.NotFound:
+                del embed_messages[user_id]
+            except discord.HTTPException:
+                # Rate limited; skip this update
+                pass
 
 @bot.command()
 async def study(ctx):
     user = ctx.author
     if user.voice and user.voice.channel:
         if user.id not in users_list:
-            users_list[user.id] = {'Start': datetime.now(),'Since': datetime.now(), 'total': 0, 'Goal': daily_goals.get(user.id, 2*3600)}
-            embed = await create_embed_message(user, 0, users_list[user.id].get('Goal'))
-            msg = await ctx.send(embed=embed)
-            for emoji in ["⏸️", "▶️", "📊"]:
-                await msg.add_reaction(emoji)
-            embed_messages[user.id] = {'message': msg, 'user': user}
-
-            await ctx.send(f"{ctx.author.display_name} has started studying @everyone")
+            # New session
+            users_list[user.id] = {
+                'Start': datetime.now(),
+                'Since': datetime.now(), 
+                'total': 0, 
+                'Goal': daily_goals.get(user.id, 2*3600)
+            }
+            await ctx.send(f"🎯 {ctx.author.display_name} has started studying! @everyone")
         else:
-            await ctx.send("You already have an active study session.")
+            # Resume existing session
+            if users_list[user.id]['Start'] == 'Paused':
+                users_list[user.id]['Start'] = datetime.now()
+                users_list[user.id]['Since'] = datetime.now()
+                await ctx.send(f"{ctx.author.display_name} has resumed studying!")
+            else:
+                await ctx.send("Your study session is already active!")
+        
+        total_time = users_list[user.id]['total']
+        if isinstance(users_list[user.id]['Start'], datetime):
+            total_time += (datetime.now() - users_list[user.id]['Start']).total_seconds()
+            
+        embed = await create_embed_message(user, total_time, users_list[user.id].get('Goal'), 
+                                         users_list[user.id]['Start'] == 'Paused')
+        msg = await ctx.send(embed=embed)
+        
+        for emoji in ["⏸️", "▶️", "📊"]:
+            await msg.add_reaction(emoji)
+            
+        embed_messages[user.id] = {'message': msg, 'user': user}
+        
     else:
         await ctx.send("YOU NEED TO BE CONNECTED TO A VOICE CHANNEL")
 
@@ -212,17 +328,17 @@ async def on_reaction_add(reaction, user):
         return
     if user.id in embed_messages and reaction.message.id == embed_messages[user.id]['message'].id:
         emoji = str(reaction.emoji)
-        if emoji == "⏸️":  # Pause
+        if emoji == "⏸️":  
             if users_list[user.id]['Start'] != "Paused":
                 UpdateTotal(user)
                 await reaction.message.channel.send(f"⏸️ {user.display_name}'s timer paused.")
 
-        elif emoji == "▶️":  # Resume
+        elif emoji == "▶️":  
             if users_list[user.id]['Start'] == "Paused":
                 users_list[user.id]['Start'] = datetime.now()
                 await reaction.message.channel.send(f"▶️ {user.display_name}'s timer resumed.")
 
-        elif emoji == "📊":  # Display Stats
+        elif emoji == "📊":  
             total_sec = users_list[user.id]['total']
             if isinstance(users_list[user.id]['Start'], datetime):
                 total_sec += (datetime.now() - users_list[user.id]['Start']).total_seconds()
@@ -292,6 +408,7 @@ async def skiptime(ctx, days: int = 1):
 @bot.event
 async def on_ready():
     print(f"Logged in as {bot.user}")
+    load_bot_state()
     load_weekly_from_db()
     update_embed_message.start()
     check_date_change.start()
@@ -389,9 +506,93 @@ async def weekly(ctx):
     msg = "\n".join(lines)
     for chunk in [msg[i:i+2000] for i in range(0, len(msg), 2000)]:
         await ctx.send(chunk)
-
+@bot.command()
+async def addtime(ctx, time: float=0.0):
+    user = ctx.author
+    if user.id in users_list:
+        users_list[user.id]['total'] += time*3600
+        await ctx.send(f"{time} hours have been added to your study time.")
+    else:
+        await ctx.send("You need to have atleast one study session to add time.")
 @bot.command()
 async def info(ctx):
-    await bot.get_channel(channel_id).send("LIST OF COMMANDS\n\n!study - Start your study session\n!pause - Pause your current study session\n!resume - Resume your current study session\n!display - Display the time on your current study session\n!daily - View stats on everyones study sessions for the day\n!weekly - View stats for the whole week\n!goal (goal in hours) - Set a daily goal, Default is 2 hours")
+    """Display information about all available commands"""
+    embed = discord.Embed(
+        title="📚 Study Bot Commands",
+        description="Here are all the commands you can use:",
+        color=0x3498db
+    )
+    
+    embed.add_field(
+        name="🎯 !study",
+        value="Start a new study session or resume/refresh an existing one. Requires being in a voice channel.",
+        inline=False
+    )
+    
+    embed.add_field(
+        name="⏸️ !pause",
+        value="Pause your currently active study session. Time will stop counting.",
+        inline=False
+    )
+    
+    embed.add_field(
+        name="▶️ !resume", 
+        value="Resume your paused study session. Time will continue counting.",
+        inline=False
+    )
+    
+    embed.add_field(
+        name="📊 !display",
+        value="Display your current total study time for today.",
+        inline=False
+    )
+    
+    embed.add_field(
+        name="📈 !daily",
+        value="View today's study standings showing all users' study times.",
+        inline=False
+    )
+    
+    embed.add_field(
+        name="📅 !weekly", 
+        value="View this week's study standings across all days.",
+        inline=False
+    )
+    
+    embed.add_field(
+        name="🎯 !goal <hours>",
+        value="Set your daily study goal in hours (e.g., !goal 3.5). Default is 2 hours.",
+        inline=False
+    )
+    
+    embed.add_field(
+        name="⏰ !addtime <hours>",
+        value="Manually add time to your study session (e.g., !addtime 1.5 for 1.5 hours).",
+        inline=False
+    )
+    
+    embed.set_footer(text="Use reactions on study embeds for quick controls!")
+    await ctx.send(embed=embed)
 
-bot.run(token, log_handler=handler, log_level=logging.DEBUG )
+
+def save_and_exit(sig=None, frame=None):
+    """Save bot state and exit gracefully"""
+    print('\nSaving bot state before shutdown...')
+    save_bot_state()
+    print('Bot state saved successfully!')
+    sys.exit(0)
+
+signal.signal(signal.SIGINT, save_and_exit)
+signal.signal(signal.SIGTERM, save_and_exit)
+atexit.register(save_bot_state)
+
+@bot.event
+async def on_disconnect():
+    save_bot_state()
+    print("💾 Bot state saved on disconnect")
+
+if __name__ == "__main__":
+    try:
+        bot.run(token, log_handler=handler, log_level=logging.DEBUG )
+    finally: 
+        save_bot_state()
