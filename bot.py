@@ -46,7 +46,7 @@ users_list = {}
 weekly_entries = {}
 embed_messages = {}
 daily_goals = {}
-channel_id = 1404847567485014057
+channel_id = 
 simulated_offset = 0
 
 current_date = datetime.now().date()
@@ -54,15 +54,15 @@ current_date = datetime.now().date()
 def save_bot_state():
     """Save current bot state to database"""
     try:
-        # Save users_list
+
         c.execute("INSERT OR REPLACE INTO bot_state (key, value) VALUES (?, ?)", 
                  ("users_list", json.dumps(users_list, default=str)))
         
-        # Save daily_goals
+
         c.execute("INSERT OR REPLACE INTO bot_state (key, value) VALUES (?, ?)", 
                  ("daily_goals", json.dumps(daily_goals)))
         
-        # Save current_date and simulated_offset
+
         c.execute("INSERT OR REPLACE INTO bot_state (key, value) VALUES (?, ?)", 
                  ("current_date", current_date.isoformat()))
         c.execute("INSERT OR REPLACE INTO bot_state (key, value) VALUES (?, ?)", 
@@ -78,7 +78,7 @@ def load_bot_state():
     global users_list, daily_goals, current_date, simulated_offset
     
     try:
-        # Load users_list
+
         result = c.execute("SELECT value FROM bot_state WHERE key = ?", ("users_list",)).fetchone()
         if result:
             loaded_users = json.loads(result[0])
@@ -96,12 +96,12 @@ def load_bot_state():
                         data['Since'] = datetime.now()
             users_list = {int(k): v for k, v in loaded_users.items()}
         
-        # Load daily_goals
+
         result = c.execute("SELECT value FROM bot_state WHERE key = ?", ("daily_goals",)).fetchone()
         if result:
             daily_goals = {int(k): v for k, v in json.loads(result[0]).items()}
         
-        # Load current_date
+
         result = c.execute("SELECT value FROM bot_state WHERE key = ?", ("current_date",)).fetchone()
         if result:
             current_date = datetime.fromisoformat(result[0]).date()
@@ -237,7 +237,6 @@ async def create_embed_message(user, total_seconds, goal, is_paused=False):
         inline=False
     )
 
-    # Footer with control legend
     embed.set_footer(text="⏸️ Pause • ▶️ Resume • 📊 Stats • 🎯 Set Goal")
 
     return embed
@@ -254,18 +253,17 @@ async def update_embed_message():
         user = msg_data['user']
         goal = udata.get('Goal', 2 * 3600)
 
-        # Determine paused state
+
         is_paused = not isinstance(udata['Start'], datetime)
 
-        # Calculate total_time
+
         total_time = udata['total']
         if not is_paused:
             total_time += (datetime.now() - udata['Start']).total_seconds()
 
-        # Round to integer seconds for comparison
+
         curr_seconds = int(total_time)
 
-        # Pull last state or default
         last_seconds, last_paused = udata.get('last_state', (-1, None))
 
         # Only update if seconds changed or paused status changed
@@ -273,7 +271,6 @@ async def update_embed_message():
             # Save new state
             udata['last_state'] = (curr_seconds, is_paused)
 
-            # Generate and send updated embed
             embed = await create_embed_message(user, total_time, goal, is_paused)
             try:
                 await msg.edit(embed=embed)
@@ -288,7 +285,6 @@ async def study(ctx):
     user = ctx.author
     if user.voice and user.voice.channel:
         if user.id not in users_list:
-            # New session
             users_list[user.id] = {
                 'Start': datetime.now(),
                 'Since': datetime.now(), 
@@ -297,7 +293,6 @@ async def study(ctx):
             }
             await ctx.send(f"🎯 {ctx.author.display_name} has started studying! @everyone")
         else:
-            # Resume existing session
             if users_list[user.id]['Start'] == 'Paused':
                 users_list[user.id]['Start'] = datetime.now()
                 users_list[user.id]['Since'] = datetime.now()
@@ -595,4 +590,5 @@ if __name__ == "__main__":
     try:
         bot.run(token, log_handler=handler, log_level=logging.DEBUG )
     finally: 
+
         save_bot_state()
